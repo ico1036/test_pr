@@ -1,0 +1,64 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: AI Code Review
+    runs-on: self-hosted  # Required for Claude Code Max authentication
+
+    # Alternative: Use ubuntu-latest with API key (uncomment and set ANTHROPIC_API_KEY)
+    # runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better context
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Setup Python with uv
+        run: uv python install 3.11
+
+      - name: Setup Node.js (for MCP servers)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies with uv
+        run: uv sync
+
+      - name: Install MCP servers
+        run: |
+          npm install -g @modelcontextprotocol/server-sequential-thinking
+
+      - name: Run AI PR Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # For API key authentication (alternative to self-hosted):
+          # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          uv run python -m review_agent.main \
+            --repo "$GITHUB_REPOSITORY" \
+            --pr-number "$PR_NUMBER"
+
+      - name: Upload review logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-logs
+          path: |
+            *.log
+          retention-days: 7
