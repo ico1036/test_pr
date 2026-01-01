@@ -50,7 +50,7 @@ jobs:
           # For API key authentication (alternative to self-hosted):
           # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          uv run python -m review_agent.main \
+          uv run review-agent review \
             --repo "$GITHUB_REPOSITORY" \
             --pr-number "$PR_NUMBER"
 

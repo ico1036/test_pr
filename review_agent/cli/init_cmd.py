@@ -26,14 +26,14 @@ jobs:
 
       - uses: astral-sh/setup-uv@v4
 
-      - name: Install review-agent
-        run: uv pip install review-agent
+      - name: Install dependencies
+        run: uv sync
 
       - name: Run AI PR Review
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          uv run review-agent \\
+          uv run review-agent review \\
             --repo "${{ github.repository }}" \\
             --pr-number "${{ github.event.pull_request.number }}"
 '''
@@ -75,31 +75,36 @@ def init_repository(target_dir: Path = None):
         print(f"Error: {target} is not a git repository")
         return False
 
+    created_files = []
+
     # Create workflow
     workflow_dir = target / ".github" / "workflows"
     workflow_dir.mkdir(parents=True, exist_ok=True)
 
     workflow_file = workflow_dir / "pr-review.yml"
     if workflow_file.exists():
-        print(f"Warning: {workflow_file} already exists, skipping")
+        print(f"Already exists: {workflow_file}")
     else:
         workflow_file.write_text(WORKFLOW_TEMPLATE)
-        print(f"Created {workflow_file}")
+        print(f"Created: {workflow_file}")
+        created_files.append(workflow_file)
 
     # Create MCP config
     mcp_file = target / ".mcp.json"
     if mcp_file.exists():
-        print(f"Warning: {mcp_file} already exists, skipping")
+        print(f"Already exists: {mcp_file}")
     else:
         mcp_file.write_text(MCP_CONFIG)
-        print(f"Created {mcp_file}")
+        print(f"Created: {mcp_file}")
+        created_files.append(mcp_file)
 
-    print("\nSetup complete!")
-    print("\nNext steps:")
-    print("  1. Configure self-hosted runner (for Claude Code Max)")
-    print("     Or add ANTHROPIC_API_KEY to GitHub secrets")
-    print("  2. git add . && git commit -m 'Add AI PR Review'")
-    print("  3. git push")
+    if created_files:
+        print("\nNext steps:")
+        print("  1. git add . && git commit -m 'Add AI PR Review'")
+        print("  2. git push")
+        print("  3. Configure self-hosted runner (Settings → Actions → Runners)")
+    else:
+        print("\nAlready configured. No changes needed.")
 
     return True
 
