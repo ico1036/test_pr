@@ -4,7 +4,7 @@
 
 set -e
 
-REPO_URL="https://github.com/owner/review-agent"  # 실제 레포로 변경
+REPO_URL="https://github.com/YOUR_USERNAME/YOUR_REPO"
 BRANCH="main"
 
 echo "Installing AI PR Review Agent..."

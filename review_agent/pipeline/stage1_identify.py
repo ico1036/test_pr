@@ -127,6 +127,9 @@ potential problems - false positives will be filtered in the next stage.""",
     )
 
     # Run agent
+    print("  [Stage 1] Starting issue identification...")
+    issue_count = 0
+
     async with ClaudeSDKClient(options=options) as client:
         await client.query(STAGE1_PROMPT.format(hunks=hunks_text))
 
@@ -134,17 +137,23 @@ potential problems - false positives will be filtered in the next stage.""",
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        # Log assistant thinking
-                        pass
+                        # Show agent thinking (truncated)
+                        text = block.text.strip()
+                        if text and len(text) > 10:
+                            preview = text[:100] + "..." if len(text) > 100 else text
+                            print(f"  [Stage 1] Analyzing: {preview}")
                     elif isinstance(block, ToolUseBlock):
-                        # Tool calls are handled automatically
-                        pass
+                        if block.name == "mcp__review__store_issue":
+                            issue_count += 1
+                            file_path = block.input.get("file_path", "unknown")
+                            severity = block.input.get("severity", "?")
+                            print(f"  [Stage 1] Found issue #{issue_count}: {file_path} ({severity})")
 
             elif isinstance(message, ResultMessage):
-                # Agent completed
-                print(f"Stage 1 completed in {message.duration_ms}ms")
+                duration_sec = message.duration_ms / 1000
+                print(f"  [Stage 1] Completed in {duration_sec:.1f}s - Found {issue_count} potential issues")
                 if message.is_error:
-                    print(f"Error: {message}")
+                    print(f"  [Stage 1] Error: {message}")
 
     # Convert stored dicts to PotentialIssue objects
     issues = []

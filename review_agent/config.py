@@ -26,7 +26,10 @@ class ReviewConfig:
     report_low: bool = False  # Skip low severity by default
 
     # Parallel processing
-    parallel_validation: bool = False  # Validate issues in parallel
+    parallel_validation: bool = True  # Validate issues in parallel (default: enabled)
+
+    # Severity filtering at Stage 1 (skip validation for low severity)
+    min_severity: str = "medium"  # low, medium, high, critical
 
     # MCP servers
     use_serena: bool = True
@@ -44,7 +47,8 @@ class ReviewConfig:
             post_comments=os.environ.get("POST_COMMENTS", "true").lower() == "true",
             post_summary=os.environ.get("POST_SUMMARY", "true").lower() == "true",
             report_low=os.environ.get("REPORT_LOW", "false").lower() == "true",
-            parallel_validation=os.environ.get("PARALLEL_VALIDATION", "false").lower() == "true",
+            parallel_validation=os.environ.get("PARALLEL_VALIDATION", "true").lower() == "true",
+            min_severity=os.environ.get("MIN_SEVERITY", "medium"),
         )
 
 

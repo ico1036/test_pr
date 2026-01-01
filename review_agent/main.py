@@ -66,6 +66,20 @@ async def run_review(config: ReviewConfig) -> dict:
     potential_issues = await identify_issues(hunks_text)
     logger.info(f"Stage 1 complete: Found {len(potential_issues)} potential issues")
 
+    # Filter by min_severity before Stage 2 (skip validation for low severity)
+    severity_order = ["low", "medium", "high", "critical"]
+    min_sev_idx = severity_order.index(config.min_severity)
+    filtered_issues = [
+        issue for issue in potential_issues
+        if severity_order.index(issue.severity.lower()) >= min_sev_idx
+    ]
+
+    if len(filtered_issues) < len(potential_issues):
+        skipped = len(potential_issues) - len(filtered_issues)
+        logger.info(f"Filtered out {skipped} issues below {config.min_severity} severity")
+
+    potential_issues = filtered_issues
+
     if not potential_issues:
         logger.info("No potential issues found")
         if config.post_summary:
@@ -196,7 +210,8 @@ def cmd_review(args):
     config.post_comments = not args.no_comments
     config.post_summary = not args.no_summary
     config.report_low = args.report_low
-    config.parallel_validation = args.parallel
+    config.parallel_validation = args.parallel and not args.no_parallel
+    config.min_severity = args.min_severity
 
     # Validate
     if not config.repo:
@@ -267,7 +282,20 @@ def main():
     review_parser.add_argument(
         "--parallel",
         action="store_true",
-        help="Validate issues in parallel"
+        default=True,
+        help="Validate issues in parallel (default: enabled)"
+    )
+    review_parser.add_argument(
+        "--no-parallel",
+        action="store_true",
+        help="Disable parallel validation"
+    )
+    review_parser.add_argument(
+        "--min-severity",
+        type=str,
+        default="medium",
+        choices=["low", "medium", "high", "critical"],
+        help="Minimum severity to validate (default: medium, skips low)"
     )
     review_parser.add_argument(
         "--debug",

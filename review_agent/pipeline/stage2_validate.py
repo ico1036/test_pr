@@ -93,6 +93,8 @@ async def validate_single_issue(issue: PotentialIssue) -> ValidatedIssue:
     Returns:
         ValidatedIssue with evidence and verdict
     """
+    print(f"  [Validate] {issue.file_path}:{issue.line_start} ({issue.severity})")
+
     global _verdict_storage
     _verdict_storage = StorageTool()
 
@@ -160,14 +162,20 @@ evidence from the codebase and documentation. Be thorough but objective.""",
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        pass  # Agent reasoning
+                        text = block.text.strip()
+                        if text and len(text) > 10:
+                            preview = text[:80] + "..." if len(text) > 80 else text
+                            print(f"    Investigating: {preview}")
                     elif isinstance(block, ToolUseBlock):
-                        pass  # Tool calls handled
+                        tool_name = block.name.split("__")[-1]
+                        print(f"    Using tool: {tool_name}")
 
             elif isinstance(message, ResultMessage):
-                print(f"  Validated in {message.duration_ms}ms")
+                duration_sec = message.duration_ms / 1000
+                verdict = "valid" if _verdict_storage.values and _verdict_storage.values[0].get("is_valid") else "false positive"
+                print(f"    Result: {verdict} ({duration_sec:.1f}s)")
                 if message.is_error:
-                    print(f"  Error: {message}")
+                    print(f"    Error: {message}")
 
     # Build ValidatedIssue from verdict
     if _verdict_storage.values:
@@ -211,11 +219,14 @@ async def validate_issues(
         return []
 
     print(f"Stage 2: Validating {len(potential_issues)} potential issues...")
+    print(f"  Mode: {'parallel' if parallel else 'sequential'}")
 
     if parallel:
         # Parallel validation (faster but more resource intensive)
+        print(f"  Starting {len(potential_issues)} parallel validations...")
         tasks = [validate_single_issue(issue) for issue in potential_issues]
         validated = await asyncio.gather(*tasks, return_exceptions=True)
+        print("  All parallel validations completed")
 
         # Filter out exceptions
         results = []
