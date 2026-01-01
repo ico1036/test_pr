@@ -1001,12 +1001,20 @@ PR #123 Created (feature/user-auth)
 │                        Implementation Phases                             │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  Phase 1: Single PR Review (MVP)                                         │
+│  Phase 1: Single PR Review (MVP) ✅ COMPLETE                             │
 │  ───────────────────────────────                                         │
 │  - Stage 1 & 2 구현                                                      │
 │  - GitHub Actions 연동                                                   │
 │  - 기본 리뷰 코멘트                                                      │
 │  - 목표: POC 완성                                                        │
+│                                                                          │
+│  Phase 1.5: Performance Optimization                                     │
+│  ────────────────────────────────────                                    │
+│  - Stage 2 병렬 실행 (--parallel 기본 활성화)                            │
+│  - Stage 1에서 low severity 필터링                                       │
+│  - MCP 서버 연결 재사용                                                  │
+│  - 동일 파일 캐싱                                                        │
+│  - 목표: 20분 → 5분 이하                                                 │
 │                                                                          │
 │  Phase 2: Multi-PR Orchestration                                         │
 │  ───────────────────────────────                                         │
