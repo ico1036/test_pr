@@ -14,13 +14,14 @@ Or via GitHub Actions (see .github/workflows/pr-review.yml)
 import argparse
 import asyncio
 import sys
+import time
 from typing import List
 
 from .config import ReviewConfig
 from .models import ValidatedIssue
 from .pipeline import identify_issues, validate_issues
 from .tools import GitHubTool, parse_pr_diff, format_hunks
-from .utils import setup_logging, get_logger
+from .utils import setup_logging, get_logger, calculate_metrics, format_metrics_report, check_quality_targets
 
 
 async def run_review(config: ReviewConfig) -> dict:
@@ -36,6 +37,8 @@ async def run_review(config: ReviewConfig) -> dict:
     logger = get_logger()
 
     logger.info(f"Starting review for {config.repo} PR #{config.pr_number}")
+    
+    start_time = time.time()
 
     # Initialize GitHub tool
     github = GitHubTool(
@@ -85,12 +88,37 @@ async def run_review(config: ReviewConfig) -> dict:
     logger.info(f"Stage 2 complete: {valid_count} valid issues, {false_positives} false positives filtered")
     logger.info(f"Reporting {len(reportable_issues)} issues (after confidence/severity filtering)")
 
+    # Calculate metrics
+    duration_ms = int((time.time() - start_time) * 1000)
+    metrics = calculate_metrics(potential_issues, validated_issues, duration_ms)
+    
+    # Log metrics report
+    logger.info("\n" + format_metrics_report(metrics))
+    
+    # Check quality targets
+    targets = check_quality_targets(metrics)
+    if targets["all_targets_met"]:
+        logger.info("✅ All quality targets met!")
+    else:
+        logger.warning("⚠️  Some quality targets not met:")
+        if not targets["precision_target"]:
+            logger.warning(f"  - Precision {metrics.precision:.1%} < 80% target")
+        if not targets["fpr_target"]:
+            logger.warning(f"  - False Positive Rate {metrics.false_positive_rate:.1%} > 20% target")
+
     stats = {
         "status": "completed",
         "potential": len(potential_issues),
         "valid": valid_count,
         "false_positives": false_positives,
         "reported": len(reportable_issues),
+        "metrics": {
+            "precision": metrics.precision,
+            "false_positive_rate": metrics.false_positive_rate,
+            "avg_confidence": metrics.avg_confidence,
+            "duration_ms": duration_ms,
+        },
+        "quality_targets_met": targets["all_targets_met"],
     }
 
     # Post comments
