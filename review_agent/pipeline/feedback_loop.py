@@ -1,13 +1,24 @@
 """Feedback Loop: Review → Fix → Re-review → Merge.
 
 This is the CORE of the system. Without this loop, everything else is useless.
+
+200% VERSION:
+- Git commit/push with proper branch handling
+- Test verification after fixes
+- Re-review verification to confirm fixes work
+- Comprehensive error handling
+- Detailed progress tracking
+- File change detection before/after
 """
 
 import asyncio
 import hashlib
-from typing import List, Optional, Tuple, Set, Dict
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple, Set, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from datetime import datetime
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -30,21 +41,37 @@ from .stage2_validate import validate_issues
 
 class LoopResult(Enum):
     """Result of the feedback loop."""
-    MERGED = "merged"           # Successfully merged
-    MAX_ITERATIONS = "max_iterations"  # Hit max iterations
-    UNFIXABLE = "unfixable"     # Issues couldn't be fixed
-    ERROR = "error"             # Error occurred
+    MERGED = "merged"                    # Successfully merged
+    READY_TO_MERGE = "ready_to_merge"    # Clean, ready for merge (auto_merge=False)
+    MAX_ITERATIONS = "max_iterations"    # Hit max iterations
+    UNFIXABLE = "unfixable"              # Issues couldn't be fixed
+    TEST_FAILED = "test_failed"          # Tests failed after fix
+    ERROR = "error"                      # Error occurred
 
 
 @dataclass
 class LoopConfig:
     """Configuration for the feedback loop."""
-    max_iterations: int = 5          # Max fix attempts
-    auto_fix: bool = True            # Auto-fix issues
-    auto_merge: bool = True          # Auto-merge when clean
+    max_iterations: int = 5              # Max fix attempts
+    auto_fix: bool = True                # Auto-fix issues
+    auto_merge: bool = True              # Auto-merge when clean
     min_severity_to_fix: str = "medium"  # Only fix medium+ issues
     commit_message_prefix: str = "fix: "
-    skip_repeated_issues: bool = True  # Skip issues that failed to fix before
+    skip_repeated_issues: bool = True    # Skip issues that failed to fix before
+    run_tests: bool = False              # Run tests after fixes
+    test_command: str = "pytest"         # Command to run tests
+    require_tests_pass: bool = False     # Require tests to pass before merge
+    working_dir: Optional[str] = None    # Working directory for git operations
+
+
+@dataclass
+class FixResult:
+    """Result of fixing a single issue."""
+    issue_hash: str
+    file_path: str
+    success: bool
+    error: Optional[str] = None
+    changes_made: bool = False
 
 
 @dataclass
@@ -53,15 +80,18 @@ class LoopStatus:
     iteration: int
     issues_found: int
     issues_fixed: int
-    issues_skipped: int = 0  # Issues skipped (already attempted)
+    issues_skipped: int = 0              # Issues skipped (already attempted)
+    tests_passed: Optional[bool] = None  # Test results
+    commit_sha: Optional[str] = None     # Git commit SHA
     result: Optional[LoopResult] = None
     error: Optional[str] = None
+    duration_ms: int = 0
 
 
 def _issue_hash(issue: ValidatedIssue) -> str:
     """Generate a unique hash for an issue to detect duplicates."""
     key = f"{issue.issue.file_path}:{issue.issue.line_start}:{issue.issue.issue_type}:{issue.issue.description[:100]}"
-    return hashlib.sha256(key.encode()).hexdigest()
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def _get_changed_files_from_diff(diff_text: str) -> Set[str]:
@@ -74,10 +104,9 @@ def _get_changed_files_from_diff(diff_text: str) -> Set[str]:
     return files
 
 
-FIX_PROMPT = """
-You are a senior developer fixing code issues. Fix the following issue in the codebase.
+FIX_PROMPT = """You are a senior developer fixing a code issue.
 
-## Issue to Fix
+## Issue
 - File: {file_path}
 - Lines: {line_start}-{line_end}
 - Type: {issue_type}
@@ -89,14 +118,14 @@ You are a senior developer fixing code issues. Fix the following issue in the co
 {code_snippet}
 ```
 
-## Mitigation Suggestion
+## Fix Guidance
 {mitigation}
 
-## Instructions
-1. Use the Edit tool to fix this issue
-2. Make minimal changes - only fix the issue, don't refactor
-3. Ensure the fix is correct and doesn't introduce new issues
-4. After fixing, briefly explain what you changed
+## Rules
+1. Use the Edit tool to fix ONLY this specific issue
+2. Make MINIMAL changes - don't refactor other code
+3. Don't add comments
+4. Ensure the fix doesn't break anything
 
 Fix this issue now.
 """
@@ -112,252 +141,306 @@ async def run_feedback_loop(
     Run the complete feedback loop: Review → Fix → Re-review → Merge.
 
     This is the CORE function of the entire system.
-
-    Args:
-        repo: Repository in format owner/repo
-        pr_number: PR number to process
-        config: Loop configuration
-        github_token: GitHub token
-
-    Returns:
-        Tuple of (final result, list of iteration statuses)
     """
     config = config or LoopConfig()
     statuses: List[LoopStatus] = []
+    working_dir = config.working_dir or os.getcwd()
 
-    # Track issues we've already attempted to fix (to avoid infinite loops)
+    # Track issues
     attempted_issues: Set[str] = set()
-    # Track issues that couldn't be fixed
     unfixable_issues: Set[str] = set()
+    fixed_in_iteration: Dict[int, Set[str]] = {}
 
     print(f"\n{'='*60}")
     print(f"FEEDBACK LOOP: {repo} PR #{pr_number}")
-    print(f"Max iterations: {config.max_iterations}")
+    print(f"{'='*60}")
+    print(f"  Max iterations: {config.max_iterations}")
+    print(f"  Run tests: {config.run_tests}")
+    print(f"  Auto merge: {config.auto_merge}")
+    print(f"  Working dir: {working_dir}")
     print(f"{'='*60}\n")
 
     # Initialize GitHub tool
     github = GitHubTool(repo=repo, pr_number=pr_number, token=github_token)
 
-    for iteration in range(1, config.max_iterations + 1):
-        print(f"\n--- Iteration {iteration}/{config.max_iterations} ---\n")
+    # Get PR branch info and checkout
+    pr_branch = await _get_pr_branch(github)
+    print(f"PR branch: {pr_branch}")
+    await _checkout_branch(pr_branch, working_dir)
 
-        status = LoopStatus(iteration=iteration, issues_found=0, issues_fixed=0, issues_skipped=0)
+    for iteration in range(1, config.max_iterations + 1):
+        start_time = datetime.now()
+        print(f"\n{'-'*60}")
+        print(f"ITERATION {iteration}/{config.max_iterations}")
+        print(f"{'-'*60}\n")
+
+        status = LoopStatus(
+            iteration=iteration,
+            issues_found=0,
+            issues_fixed=0,
+            issues_skipped=0
+        )
+        fixed_in_iteration[iteration] = set()
 
         try:
-            # Step 1: Get PR diff and review
-            print("[1/4] Fetching and reviewing PR...")
+            # Step 1: Fetch latest and get diff
+            print("[1/5] Fetching PR diff...")
+            await _pull_latest(working_dir)
             diff_text = github.get_diff()
 
             if not diff_text.strip():
-                print("  No changes in PR")
-                status.result = LoopResult.MERGED
+                print("  OK: No changes in PR")
+                status.result = LoopResult.READY_TO_MERGE
                 statuses.append(status)
                 break
 
-            # Get list of files actually changed in PR
             changed_files = _get_changed_files_from_diff(diff_text)
             print(f"  Changed files: {len(changed_files)}")
+            for f in list(changed_files)[:5]:
+                print(f"    - {f}")
+            if len(changed_files) > 5:
+                print(f"    ... and {len(changed_files) - 5} more")
 
-            # Step 2: Run Stage 1,2 review
+            # Step 2: Identify issues
+            print("\n[2/5] Identifying issues...")
             from ..tools import parse_pr_diff, format_hunks
             file_diffs = parse_pr_diff(diff_text)
             hunks_text = format_hunks(file_diffs)
 
-            print("[2/4] Stage 1: Identifying issues...")
             potential_issues = await identify_issues(hunks_text)
 
-            # Filter by severity
+            # Filter by severity and changed files
             severity_order = ["low", "medium", "high", "critical"]
             try:
                 min_idx = severity_order.index(config.min_severity_to_fix)
             except ValueError:
                 min_idx = 0
-            potential_issues = [
-                i for i in potential_issues
-                if i.severity.lower() in severity_order and severity_order.index(i.severity.lower()) >= min_idx
-            ]
 
-            # Filter to only issues in changed files
             potential_issues = [
                 i for i in potential_issues
-                if i.file_path in changed_files
+                if (i.severity.lower() in severity_order and
+                    severity_order.index(i.severity.lower()) >= min_idx and
+                    i.file_path in changed_files)
             ]
 
             if not potential_issues:
-                print("  No issues found - PR is clean!")
-                status.result = LoopResult.MERGED
+                print("  OK: No issues found - PR is clean!")
+                status.result = LoopResult.READY_TO_MERGE
                 statuses.append(status)
-
-                if config.auto_merge:
-                    print("[4/4] Auto-merging PR...")
-                    await _merge_pr(github)
-
                 break
 
             print(f"  Found {len(potential_issues)} potential issues")
 
-            print("[3/4] Stage 2: Validating issues...")
+            # Step 3: Validate issues
+            print("\n[3/5] Validating issues...")
             validated_issues = await validate_issues(potential_issues, parallel=True)
             valid_issues = [i for i in validated_issues if i.is_valid]
 
             status.issues_found = len(valid_issues)
-            print(f"  {len(valid_issues)} valid issues confirmed")
+            print(f"  OK: {len(valid_issues)} valid issues confirmed")
 
             if not valid_issues:
-                print("  All issues were false positives - PR is clean!")
-                status.result = LoopResult.MERGED
+                print("  OK: All issues were false positives - PR is clean!")
+                status.result = LoopResult.READY_TO_MERGE
                 statuses.append(status)
-
-                if config.auto_merge:
-                    print("[4/4] Auto-merging PR...")
-                    await _merge_pr(github)
-
                 break
 
-            # Filter out issues we've already tried to fix
+            # Filter out already-attempted issues
             if config.skip_repeated_issues:
                 new_issues = []
                 for issue in valid_issues:
                     issue_id = _issue_hash(issue)
                     if issue_id in unfixable_issues:
                         status.issues_skipped += 1
-                        print(f"    Skipping unfixable issue: {issue.issue.file_path}:{issue.issue.line_start}")
+                        print(f"    SKIP (unfixable): {issue.issue.file_path}:{issue.issue.line_start}")
                     elif issue_id in attempted_issues:
-                        # Issue reappeared after fix attempt - mark as unfixable
                         unfixable_issues.add(issue_id)
                         status.issues_skipped += 1
-                        print(f"    Issue reappeared after fix, marking unfixable: {issue.issue.file_path}:{issue.issue.line_start}")
+                        print(f"    SKIP (reappeared): {issue.issue.file_path}:{issue.issue.line_start}")
                     else:
                         new_issues.append(issue)
                 valid_issues = new_issues
 
                 if not valid_issues:
                     if unfixable_issues:
-                        print(f"  All remaining issues ({len(unfixable_issues)}) are unfixable")
+                        print(f"  FAIL: All {len(unfixable_issues)} remaining issues are unfixable")
                         status.result = LoopResult.UNFIXABLE
                     else:
-                        print("  No new issues to fix - PR is clean!")
-                        status.result = LoopResult.MERGED
-                        if config.auto_merge:
-                            print("[4/4] Auto-merging PR...")
-                            await _merge_pr(github)
+                        print("  OK: No new issues - PR is clean!")
+                        status.result = LoopResult.READY_TO_MERGE
                     statuses.append(status)
                     break
 
-            # Step 3: Fix issues
-            if config.auto_fix:
-                print(f"[4/4] Auto-fixing {len(valid_issues)} issues...")
-                fixed_count, fixed_issues, fixed_files = await _fix_issues(valid_issues, github, attempted_issues)
-                status.issues_fixed = fixed_count
-                print(f"  Fixed {fixed_count}/{len(valid_issues)} issues")
-
-                if fixed_count > 0:
-                    # Commit and push fixes
-                    commit_success = await _commit_and_push(config.commit_message_prefix, iteration, fixed_files)
-                    if commit_success:
-                        print("  Committed and pushed fixes")
-                    else:
-                        print("  No changes to commit (fixes may not have been applied)")
-                else:
-                    print("  Could not fix any issues")
-                    # Mark all as unfixable
-                    for issue in valid_issues:
-                        unfixable_issues.add(_issue_hash(issue))
-                    status.result = LoopResult.UNFIXABLE
-                    statuses.append(status)
-                    break
-            else:
-                # Just post comments and exit
-                print("[3/4] Posting review comments (auto-fix disabled)...")
-                posted_count = 0
-                failed_count = 0
+            # Step 4: Fix issues
+            if not config.auto_fix:
+                print("\n[4/5] Auto-fix disabled, posting comments...")
                 for issue in valid_issues:
-                    try:
-                        github.post_review_comment(issue)
-                        posted_count += 1
-                    except Exception as e:
-                        failed_count += 1
-                        print(f"  Failed to post comment: {e}")
-                if failed_count > 0:
-                    print(f"  Posted {posted_count}/{len(valid_issues)} comments ({failed_count} failed)")
+                    github.post_review_comment(issue)
                 status.result = LoopResult.UNFIXABLE
                 statuses.append(status)
                 break
 
+            print(f"\n[4/5] Fixing {len(valid_issues)} issues...")
+            fix_results = await _fix_issues_batch(valid_issues, attempted_issues, working_dir)
+
+            # Count successes
+            successful_fixes = [r for r in fix_results if r.success and r.changes_made]
+            status.issues_fixed = len(successful_fixes)
+            fixed_files = list(set(r.file_path for r in successful_fixes))
+
+            for r in successful_fixes:
+                fixed_in_iteration[iteration].add(r.issue_hash)
+
+            print(f"  OK: Fixed {status.issues_fixed}/{len(valid_issues)} issues")
+
+            if status.issues_fixed == 0:
+                print("  FAIL: Could not fix any issues")
+                for issue in valid_issues:
+                    unfixable_issues.add(_issue_hash(issue))
+                status.result = LoopResult.UNFIXABLE
+                statuses.append(status)
+                break
+
+            # Step 5: Run tests (if enabled)
+            if config.run_tests:
+                print("\n[5/5] Running tests...")
+                tests_passed = await _run_tests(config.test_command, working_dir)
+                status.tests_passed = tests_passed
+
+                if not tests_passed:
+                    print("  FAIL: Tests failed!")
+                    if config.require_tests_pass:
+                        print("  Reverting changes...")
+                        await _revert_changes(working_dir)
+                        for r in successful_fixes:
+                            unfixable_issues.add(r.issue_hash)
+                        status.result = LoopResult.TEST_FAILED
+                        statuses.append(status)
+                        break
+                else:
+                    print("  OK: Tests passed!")
+            else:
+                print("\n[5/5] Tests skipped")
+
+            # Commit and push
+            commit_sha = await _commit_and_push(
+                prefix=config.commit_message_prefix,
+                iteration=iteration,
+                files=fixed_files,
+                working_dir=working_dir
+            )
+
+            if commit_sha:
+                status.commit_sha = commit_sha
+                print(f"  OK: Committed and pushed: {commit_sha[:8]}")
+            else:
+                print("  WARN: No changes to commit")
+
+            # Calculate duration
+            status.duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
             statuses.append(status)
 
         except Exception as e:
-            print(f"  ERROR: {e}")
+            print(f"\n  ERROR: {e}")
             import traceback
             traceback.print_exc()
             status.error = str(e)
             status.result = LoopResult.ERROR
+            status.duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
             statuses.append(status)
             break
 
-    # Check if we hit max iterations
+    # Final result
     if statuses and statuses[-1].result is None:
         statuses[-1].result = LoopResult.MAX_ITERATIONS
-        print(f"\n  Hit max iterations ({config.max_iterations})")
+        print(f"\n  WARN: Hit max iterations ({config.max_iterations})")
+
+    final_result = statuses[-1].result if statuses else LoopResult.ERROR
+
+    # Handle merge
+    if final_result == LoopResult.READY_TO_MERGE and config.auto_merge:
+        if await _do_merge(github):
+            final_result = LoopResult.MERGED
+            statuses[-1].result = LoopResult.MERGED
 
     # Print summary
-    final_result = statuses[-1].result if statuses else LoopResult.ERROR
-    print(f"\n{'='*60}")
-    print(f"LOOP COMPLETE: {final_result.value}")
-    print(f"Total iterations: {len(statuses)}")
-    if unfixable_issues:
-        print(f"Unfixable issues: {len(unfixable_issues)}")
-    print(f"{'='*60}\n")
+    _print_summary(final_result, statuses, unfixable_issues, fixed_in_iteration)
 
     return final_result, statuses
 
 
-async def _fix_issues(
+async def _fix_issues_batch(
     issues: List[ValidatedIssue],
-    github: GitHubTool,
     attempted_issues: Set[str],
-) -> Tuple[int, List[str], List[str]]:
-    """Fix issues using Claude Agent.
+    working_dir: str,
+) -> List[FixResult]:
+    """Fix multiple issues, tracking results."""
+    results = []
 
-    Returns:
-        Tuple of (fixed_count, list of fixed issue hashes, list of fixed file paths)
-    """
-    fixed_count = 0
-    fixed_hashes = []
-    fixed_files = []
-
-    for issue in issues:
+    for i, issue in enumerate(issues, 1):
         issue_id = _issue_hash(issue)
         attempted_issues.add(issue_id)
 
+        print(f"  [{i}/{len(issues)}] {issue.issue.file_path}:{issue.issue.line_start} ({issue.issue.issue_type})")
+
+        result = FixResult(
+            issue_hash=issue_id,
+            file_path=issue.issue.file_path,
+            success=False
+        )
+
         try:
-            success = await _fix_single_issue(issue)
-            if success:
-                fixed_count += 1
-                fixed_hashes.append(issue_id)
-                fixed_files.append(issue.issue.file_path)
+            # Check file exists
+            file_path = Path(working_dir) / issue.issue.file_path
+            if not file_path.exists():
+                result.error = "File not found"
+                print(f"      FAIL: File not found")
+                results.append(result)
+                continue
+
+            # Get content before fix
+            before_content = file_path.read_text()
+
+            # Attempt fix
+            success = await _fix_single_issue(issue, working_dir)
+
+            # Check if file changed
+            after_content = file_path.read_text()
+            changes_made = before_content != after_content
+
+            result.success = success
+            result.changes_made = changes_made
+
+            if success and changes_made:
+                print(f"      OK: Fixed")
+            elif success and not changes_made:
+                print(f"      WARN: No changes made")
+            else:
+                print(f"      FAIL: Could not fix")
+
         except Exception as e:
-            print(f"    Failed to fix {issue.issue.file_path}: {e}")
+            result.error = str(e)
+            print(f"      ERROR: {e}")
 
-    return fixed_count, fixed_hashes, fixed_files
+        results.append(result)
+
+    return results
 
 
-async def _fix_single_issue(issue: ValidatedIssue) -> bool:
-    """Fix a single issue using Claude Agent with Edit tool.
-
-    Returns True only if Edit tool was called AND completed successfully.
-    """
+async def _fix_single_issue(issue: ValidatedIssue, working_dir: str) -> bool:
+    """Fix a single issue using Claude Agent with Edit tool."""
 
     options = ClaudeAgentOptions(
-        system_prompt="""You are a senior developer. Fix code issues with minimal changes.
-IMPORTANT:
-- You MUST use the Edit tool to make changes
-- Make ONLY the minimal change needed to fix the specific issue
+        system_prompt="""You are a senior developer fixing code issues.
+RULES:
+- Use the Edit tool to make changes
+- Make ONLY the minimal change to fix the issue
 - Do NOT refactor or change unrelated code
-- Do NOT add comments explaining the fix""",
+- Do NOT add comments""",
         allowed_tools=["Edit", "Read"],
         permission_mode="acceptEdits",
         max_turns=10,
+        working_directory=working_dir,
     )
 
     prompt = FIX_PROMPT.format(
@@ -372,8 +455,7 @@ IMPORTANT:
     )
 
     try:
-        edit_attempted = False
-        edit_succeeded = False
+        edit_count = 0
 
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
@@ -381,106 +463,238 @@ IMPORTANT:
             async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
-                        if isinstance(block, ToolUseBlock):
-                            if block.name == "Edit":
-                                edit_attempted = True
-                                print(f"    Editing {issue.issue.file_path}...")
-                        elif isinstance(block, ToolResultBlock):
-                            # Check if the edit was successful
-                            if edit_attempted and not edit_succeeded:
-                                # ToolResultBlock indicates tool completed
-                                # If no error, consider it successful
-                                if not getattr(block, 'is_error', False):
-                                    edit_succeeded = True
-                                    print(f"    Edit successful: {issue.issue.file_path}")
+                        if isinstance(block, ToolUseBlock) and block.name == "Edit":
+                            edit_count += 1
 
-        # Only return True if edit was attempted AND succeeded
-        if edit_attempted and not edit_succeeded:
-            # Assume success if we got here without error
-            edit_succeeded = True
-
-        return edit_succeeded
+        return edit_count > 0
 
     except Exception as e:
-        print(f"    Fix failed: {e}")
+        print(f"      Fix error: {e}")
         return False
 
 
-async def _commit_and_push(prefix: str, iteration: int, files: List[str]) -> bool:
-    """Commit and push fixes.
-
-    Returns True if changes were committed and pushed, False if no changes.
-    """
+async def _run_tests(test_command: str, working_dir: str) -> bool:
+    """Run tests and return True if they pass."""
     try:
-        # Check if there are any changes to commit
+        proc = await asyncio.create_subprocess_shell(
+            test_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode == 0:
+            return True
+        else:
+            output = stdout.decode() + stderr.decode()
+            if output:
+                lines = output.strip().split('\n')
+                print(f"    Test output (last 10 lines):")
+                for line in lines[-10:]:
+                    print(f"      {line}")
+            return False
+
+    except asyncio.TimeoutError:
+        print("    FAIL: Tests timed out (5 min)")
+        return False
+    except Exception as e:
+        print(f"    ERROR: Test error: {e}")
+        return False
+
+
+async def _get_pr_branch(github: GitHubTool) -> str:
+    """Get the PR's head branch name."""
+    try:
+        return github.pr.head.ref
+    except Exception:
+        return "main"
+
+
+async def _checkout_branch(branch: str, working_dir: str) -> bool:
+    """Checkout the specified branch."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", branch,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            print(f"  Checkout warning: {stderr.decode().strip()}")
+        return proc.returncode == 0
+    except Exception as e:
+        print(f"  Checkout error: {e}")
+        return False
+
+
+async def _pull_latest(working_dir: str) -> bool:
+    """Pull latest changes from remote."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull", "--rebase",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
+        )
+        await proc.communicate()
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+async def _revert_changes(working_dir: str) -> bool:
+    """Revert all uncommitted changes."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "--", ".",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
+        )
+        await proc.communicate()
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+async def _commit_and_push(
+    prefix: str,
+    iteration: int,
+    files: List[str],
+    working_dir: str
+) -> Optional[str]:
+    """Commit and push fixes. Returns commit SHA or None."""
+    try:
+        # Check for changes
         status_proc = await asyncio.create_subprocess_exec(
             "git", "status", "--porcelain",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
         )
         stdout, _ = await status_proc.communicate()
 
         if not stdout.decode().strip():
-            print("    No changes to commit")
-            return False
+            return None
 
-        # Stage only the specific files that were modified
-        add_proc = await asyncio.create_subprocess_exec(
-            "git", "add", "--", *files,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await add_proc.communicate()
+        # Stage files
+        if files:
+            add_proc = await asyncio.create_subprocess_exec(
+                "git", "add", "--", *files,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=working_dir
+            )
+            await add_proc.communicate()
+        else:
+            add_proc = await asyncio.create_subprocess_exec(
+                "git", "add", "-A",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=working_dir
+            )
+            await add_proc.communicate()
 
         # Commit
         msg = f"{prefix}Auto-fix issues (iteration {iteration})"
         commit_proc = await asyncio.create_subprocess_exec(
             "git", "commit", "-m", msg,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
         )
         stdout, stderr = await commit_proc.communicate()
 
         if commit_proc.returncode != 0:
             output = stdout.decode() + stderr.decode()
             if "nothing to commit" in output:
-                print("    No changes to commit")
-                return False
-            print(f"    Commit failed: {stderr.decode()}")
-            return False
+                return None
+            print(f"    Commit error: {stderr.decode()}")
+            return None
+
+        # Get commit SHA
+        sha_proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
+        )
+        stdout, _ = await sha_proc.communicate()
+        commit_sha = stdout.decode().strip()
 
         # Push
         push_proc = await asyncio.create_subprocess_exec(
             "git", "push",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
         )
         _, stderr = await push_proc.communicate()
 
         if push_proc.returncode != 0:
-            print(f"    Push failed: {stderr.decode()}")
-            return False
+            print(f"    Push error: {stderr.decode()}")
+            return None
 
-        return True
+        return commit_sha
 
     except Exception as e:
         print(f"    Git error: {e}")
-        return False
+        return None
 
 
-async def _merge_pr(github: GitHubTool) -> bool:
+async def _do_merge(github: GitHubTool) -> bool:
     """Merge the PR."""
     try:
+        print("\n[MERGE] Merging PR...")
         if not hasattr(github, 'pr') or github.pr is None:
-            print("  Merge failed: PR not initialized")
+            print("  FAIL: PR not initialized")
             return False
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: github.pr.merge(merge_method="squash"))
-        print("  PR merged successfully!")
+        github.pr.merge(merge_method="squash")
+        print("  OK: PR merged!")
         return True
     except Exception as e:
-        print(f"  Merge failed: {e}")
+        print(f"  FAIL: Merge failed: {e}")
         return False
+
+
+def _print_summary(
+    result: LoopResult,
+    statuses: List[LoopStatus],
+    unfixable_issues: Set[str],
+    fixed_in_iteration: Dict[int, Set[str]]
+):
+    """Print a comprehensive summary."""
+    print(f"\n{'='*60}")
+    print(f"FEEDBACK LOOP COMPLETE")
+    print(f"{'='*60}")
+
+    print(f"Result: {result.value.upper()}")
+
+    total_found = sum(s.issues_found for s in statuses)
+    total_fixed = sum(s.issues_fixed for s in statuses)
+    total_skipped = sum(s.issues_skipped for s in statuses)
+    total_time = sum(s.duration_ms for s in statuses)
+
+    print(f"\nStatistics:")
+    print(f"  Iterations:     {len(statuses)}")
+    print(f"  Issues found:   {total_found}")
+    print(f"  Issues fixed:   {total_fixed}")
+    print(f"  Issues skipped: {total_skipped}")
+    print(f"  Unfixable:      {len(unfixable_issues)}")
+    print(f"  Total time:     {total_time/1000:.1f}s")
+
+    if statuses:
+        print(f"\nIteration details:")
+        for s in statuses:
+            test_info = ""
+            if s.tests_passed is not None:
+                test_info = " tests:PASS" if s.tests_passed else " tests:FAIL"
+            commit_info = f" [{s.commit_sha[:8]}]" if s.commit_sha else ""
+            print(f"  [{s.iteration}] found:{s.issues_found} fixed:{s.issues_fixed} skip:{s.issues_skipped}{test_info}{commit_info}")
+
+    print(f"{'='*60}\n")
 
 
 # Synchronous wrapper
