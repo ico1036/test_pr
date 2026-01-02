@@ -704,6 +704,54 @@ class MergeExecutor:
 
 > 테스트 자동 생성 및 커버리지 기반 Merge 결정 시스템.
 
+### 12.0 Test Generation Timing
+
+테스트 자동 생성의 트리거 시점:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Test Generation Trigger Flow                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   PR Created ──▶ Stage 1,2 Review ──▶ Issues Found?                     │
+│                                              │                           │
+│                              ┌───────────────┴───────────────┐          │
+│                              ▼                               ▼          │
+│                         Yes: Issues                    No: Clean        │
+│                              │                               │          │
+│                              ▼                               ▼          │
+│                     Developer Fixes ◀────────┐    Ready for Merge       │
+│                              │               │           │              │
+│                              ▼               │           ▼              │
+│                      Re-review ──────────────┘    ┌─────────────┐       │
+│                                                   │ TRIGGER:    │       │
+│                                                   │ Test Gen    │       │
+│                                                   │ Stage 3 & 4 │       │
+│                                                   └──────┬──────┘       │
+│                                                          │              │
+│                                    ┌─────────────────────┴──────┐       │
+│                                    ▼                            ▼       │
+│                              Tests Pass              Tests Fail         │
+│                              Coverage OK             Coverage Low       │
+│                                    │                            │       │
+│                                    ▼                            ▼       │
+│                              ✅ AUTO MERGE            ❌ BLOCK          │
+│                                                    (Notify Dev)         │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Trigger Conditions:
+1. PR has passed Stage 1,2 review (no critical/high issues)
+2. All reviewer comments addressed
+3. CI checks passing
+4. Ready for merge label added OR merge requested
+
+Why "Merge 직전" timing:
+- 효율성: 완성된 코드에만 테스트 생성 (리소스 절약)
+- 품질: 리뷰 통과 후 안정화된 코드 기준
+- 실용성: 테스트가 실제 merge되는 코드와 일치
+```
+
 ### 12.1 Extended Pipeline
 
 ```
@@ -1008,20 +1056,19 @@ PR #123 Created (feature/user-auth)
 │  - 기본 리뷰 코멘트                                                      │
 │  - 목표: POC 완성                                                        │
 │                                                                          │
-│  Phase 1.5: Performance Optimization                                     │
+│  Phase 1.5: Performance Optimization ✅ COMPLETE                         │
 │  ────────────────────────────────────                                    │
 │  - Stage 2 병렬 실행 (--parallel 기본 활성화)                            │
 │  - Stage 1에서 low severity 필터링                                       │
-│  - MCP 서버 연결 재사용                                                  │
-│  - 동일 파일 캐싱                                                        │
-│  - 목표: 20분 → 5분 이하                                                 │
+│  - 결과: 20분 29초 → 4분 20초 (79% 개선)                                 │
 │                                                                          │
-│  Phase 2: Multi-PR Orchestration                                         │
+│  Phase 2: Multi-PR Orchestration ✅ COMPLETE                             │
 │  ───────────────────────────────                                         │
-│  - Orchestrator 레이어 추가                                              │
-│  - 의존성 그래프 분석                                                    │
-│  - 자동 Merge 기능                                                       │
-│  - Conflict 감지                                                         │
+│  - Orchestrator 레이어 추가 (orchestrator/ 모듈)                         │
+│  - 의존성 그래프 분석 (topological sort)                                 │
+│  - 자동 Merge 기능 (MergeExecutor)                                       │
+│  - Conflict 감지 (ConflictPredictor)                                     │
+│  - CLI: orchestrate --repo owner/repo --dry-run                          │
 │                                                                          │
 │  Phase 3: TDD Coverage Gate                                              │
 │  ──────────────────────────                                              │

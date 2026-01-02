@@ -203,6 +203,84 @@ def cmd_review(args):
         sys.exit(1)
 
 
+def cmd_orchestrate(args):
+    """Handle 'orchestrate' subcommand."""
+    import logging
+    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
+    logger = get_logger()
+
+    from .orchestrator import PROrchestrator
+    from .models import OrchestratorConfig
+
+    if not args.repo:
+        logger.error("Repository required. Use --repo")
+        sys.exit(1)
+
+    config = OrchestratorConfig(
+        merge_method=args.merge_method,
+        auto_merge=args.auto_merge,
+        delete_branch_after_merge=not args.keep_branch,
+        max_parallel_reviews=args.max_parallel,
+    )
+
+    orchestrator = PROrchestrator(
+        repo=args.repo,
+        config=config
+    )
+
+    async def run():
+        # Load PRs
+        await orchestrator.load_open_prs(base=args.base)
+
+        # Analyze
+        plan = await orchestrator.analyze()
+
+        if args.dry_run:
+            result = await orchestrator.dry_run(plan)
+            print("\n=== Dry Run Results ===")
+            print(f"Total PRs: {result['plan']['total_prs']}")
+            print(f"Merge order: {result['plan']['order']}")
+            print(f"Parallel groups: {result['plan']['parallel_groups']}")
+            print(f"Potential conflicts: {result['plan']['conflicts']}")
+            print("\nMerge readiness:")
+            for status in result['merge_readiness']:
+                ready = "READY" if status['ready'] else "NOT READY"
+                print(f"  PR #{status['pr_number']}: {ready}")
+                if not status['mergeable']:
+                    print(f"    - Merge: {status['merge_reason']}")
+                if not status['ci_passed']:
+                    print(f"    - CI: {status['ci_status']}")
+            return
+
+        # Execute
+        review_config = ReviewConfig(
+            repo=args.repo,
+            parallel_validation=True,
+            min_severity="medium",
+        )
+
+        result = await orchestrator.execute_plan(
+            plan,
+            review_config=review_config,
+            merge=args.auto_merge
+        )
+
+        print("\n=== Orchestration Results ===")
+        print(f"Total PRs: {result['summary']['total_prs']}")
+        print(f"Reviewed: {result['summary']['reviewed']}")
+        print(f"Passed: {result['summary']['passed']}")
+        print(f"Failed: {result['summary']['failed']}")
+        if args.auto_merge:
+            print(f"Merged: {result['summary']['merged']}")
+
+    try:
+        asyncio.run(run())
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(f"Orchestration failed: {e}")
+        sys.exit(1)
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -275,6 +353,57 @@ def main():
         help="Enable debug logging"
     )
 
+    # orchestrate command (Phase 2)
+    orch_parser = subparsers.add_parser(
+        "orchestrate",
+        help="Orchestrate multiple PRs (review, merge in optimal order)"
+    )
+    orch_parser.add_argument(
+        "--repo",
+        type=str,
+        required=True,
+        help="Repository in format owner/repo"
+    )
+    orch_parser.add_argument(
+        "--base",
+        type=str,
+        default="main",
+        help="Base branch to target (default: main)"
+    )
+    orch_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Analyze and show plan without executing"
+    )
+    orch_parser.add_argument(
+        "--auto-merge",
+        action="store_true",
+        help="Automatically merge PRs that pass review"
+    )
+    orch_parser.add_argument(
+        "--merge-method",
+        type=str,
+        default="squash",
+        choices=["squash", "merge", "rebase"],
+        help="Merge method to use (default: squash)"
+    )
+    orch_parser.add_argument(
+        "--keep-branch",
+        action="store_true",
+        help="Don't delete branches after merge"
+    )
+    orch_parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=5,
+        help="Maximum parallel reviews (default: 5)"
+    )
+    orch_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
     args = parser.parse_args()
 
     # Route to subcommand
@@ -282,6 +411,8 @@ def main():
         cmd_init(args)
     elif args.command == "review":
         cmd_review(args)
+    elif args.command == "orchestrate":
+        cmd_orchestrate(args)
     else:
         # No subcommand - show help
         parser.print_help()
