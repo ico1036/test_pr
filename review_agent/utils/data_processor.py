@@ -6,24 +6,29 @@ import subprocess
 
 def process_user_query(query: str) -> tuple[str, str]:
     """Process a user search query."""
-    sql = "SELECT * FROM reviews WHERE content LIKE ?"
-    param = f"%{query}%"
+    sql = "SELECT * FROM reviews WHERE content LIKE ? ESCAPE '\\'"
+    escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    param = f"%{escaped_query}%"
     return sql, param
 
 
 def run_shell_command(user_input: str) -> str:
     """Run a shell command based on user input."""
-    # Command injection vulnerability
-    result = subprocess.run(["echo", user_input], capture_output=True)
-    return result.stdout.decode()
+    return user_input + "\n"
 
 
 def read_config_file(filename: str) -> str:
     """Read a configuration file."""
-    # Path traversal vulnerability
     path = f"/config/{filename}"
-    with open(path, "r") as f:
-        return f.read()
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        raise ValueError(f"Config file not found: {filename}")
+    except PermissionError:
+        raise ValueError(f"Permission denied reading config file: {filename}")
+    except OSError as e:
+        raise ValueError(f"Error reading config file {filename}: {e}")
 
 
 def calculate_ratio(numerator: int, denominator: int) -> float:
