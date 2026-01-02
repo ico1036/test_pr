@@ -1070,12 +1070,12 @@ PR #123 Created (feature/user-auth)
 │  - Conflict 감지 (ConflictPredictor)                                     │
 │  - CLI: orchestrate --repo owner/repo --dry-run                          │
 │                                                                          │
-│  Phase 3: TDD Coverage Gate                                              │
+│  Phase 3: TDD Coverage Gate ✅ COMPLETE                                  │
 │  ──────────────────────────                                              │
-│  - Stage 3 & 4 추가                                                      │
-│  - 테스트 자동 생성                                                      │
-│  - 커버리지 기반 Merge 결정                                              │
-│  - 회귀 테스트 자동화                                                    │
+│  - Stage 3: Test Generation (AI 기반 테스트 생성)                        │
+│  - Stage 4: Coverage Gate (커버리지 검증 및 Merge 결정)                  │
+│  - 회귀 테스트 자동 생성 (validated issues 기반)                         │
+│  - CLI: testgen --repo owner/repo --pr-number 1 --dry-run                │
 │                                                                          │
 │  Phase 4: Advanced (Future)                                              │
 │  ─────────────────────────                                               │

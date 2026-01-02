@@ -281,6 +281,96 @@ def cmd_orchestrate(args):
         sys.exit(1)
 
 
+def cmd_testgen(args):
+    """Handle 'testgen' subcommand (Phase 3)."""
+    import logging
+    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
+    logger = get_logger()
+
+    from .pipeline import generate_tests, CoverageGate
+    from .config import MergeRules
+    from .models import TestGenConfig
+
+    # Initialize GitHub tool
+    github = GitHubTool(
+        repo=args.repo,
+        pr_number=args.pr_number
+    )
+
+    async def run():
+        logger.info(f"Starting test generation for {args.repo} PR #{args.pr_number}")
+
+        # Get PR diff
+        logger.info("Fetching PR diff...")
+        diff_text = github.get_diff()
+        changed_files = github.get_changed_files()
+
+        if not diff_text.strip():
+            logger.info("No changes found in PR")
+            return
+
+        # First run Stage 1,2 to get validated issues
+        logger.info("Running Stage 1,2 review first...")
+        file_diffs = parse_pr_diff(diff_text)
+        hunks_text = format_hunks(file_diffs)
+
+        potential_issues = await identify_issues(hunks_text)
+        validated_issues = await validate_issues(potential_issues, parallel=True)
+
+        valid_count = len([i for i in validated_issues if i.is_valid])
+        logger.info(f"Found {valid_count} valid issues for regression tests")
+
+        # Stage 3: Generate tests
+        logger.info("Stage 3: Generating tests...")
+        config = TestGenConfig()
+        generated_tests = await generate_tests(diff_text, validated_issues, config)
+
+        logger.info(f"Generated {len(generated_tests)} test files")
+        for test in generated_tests:
+            logger.info(f"  - {test.file_path} ({test.test_count} tests)")
+
+        if args.dry_run:
+            print("\n=== Dry Run Results ===")
+            print(f"Would generate {len(generated_tests)} test files:")
+            for test in generated_tests:
+                print(f"  - {test.file_path}")
+                print(f"    Covers: {', '.join(test.covers_functions)}")
+                print(f"    Tests: {test.test_count}")
+            return
+
+        if args.skip_coverage:
+            logger.info("Skipping coverage gate (--skip-coverage)")
+            return
+
+        # Stage 4: Coverage gate
+        logger.info("Stage 4: Running coverage gate...")
+        rules = MergeRules(
+            min_total_coverage=args.min_coverage,
+            min_new_code_coverage=args.min_new_coverage,
+        )
+
+        gate = CoverageGate(rules=rules)
+        decision = await gate.execute(generated_tests, validated_issues, changed_files)
+
+        # Print decision
+        print("\n" + decision.summary())
+
+        # Auto-commit if requested
+        if args.auto_commit and decision.approved:
+            logger.info("Auto-committing generated tests...")
+            # TODO: Implement git commit logic
+            logger.warning("Auto-commit not yet implemented")
+
+        return decision
+
+    try:
+        asyncio.run(run())
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(f"Test generation failed: {e}")
+        sys.exit(1)
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -404,6 +494,56 @@ def main():
         help="Enable debug logging"
     )
 
+    # testgen command (Phase 3)
+    testgen_parser = subparsers.add_parser(
+        "testgen",
+        help="Generate tests and run coverage gate (Phase 3)"
+    )
+    testgen_parser.add_argument(
+        "--repo",
+        type=str,
+        required=True,
+        help="Repository in format owner/repo"
+    )
+    testgen_parser.add_argument(
+        "--pr-number",
+        type=int,
+        required=True,
+        help="Pull request number"
+    )
+    testgen_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate tests without writing or running them"
+    )
+    testgen_parser.add_argument(
+        "--skip-coverage",
+        action="store_true",
+        help="Skip coverage gate (only generate tests)"
+    )
+    testgen_parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=80.0,
+        help="Minimum total coverage required (default: 80%%)"
+    )
+    testgen_parser.add_argument(
+        "--min-new-coverage",
+        type=float,
+        default=90.0,
+        help="Minimum coverage for new code (default: 90%%)"
+    )
+    testgen_parser.add_argument(
+        "--auto-commit",
+        action="store_true",
+        help="Commit generated tests to PR branch"
+    )
+    testgen_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
     args = parser.parse_args()
 
     # Route to subcommand
@@ -413,6 +553,8 @@ def main():
         cmd_review(args)
     elif args.command == "orchestrate":
         cmd_orchestrate(args)
+    elif args.command == "testgen":
+        cmd_testgen(args)
     else:
         # No subcommand - show help
         parser.print_help()

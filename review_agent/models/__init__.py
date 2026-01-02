@@ -8,6 +8,14 @@ from .orchestrator import (
     OrchestratorConfig,
     OrchestrationPlan,
 )
+from .test_gen import (
+    TestType,
+    TestCategory,
+    GeneratedTest,
+    CoverageResult,
+    MergeDecision,
+    TestGenConfig,
+)
 
 __all__ = [
     "Severity",
@@ -19,4 +27,10 @@ __all__ = [
     "MergeResult",
     "OrchestratorConfig",
     "OrchestrationPlan",
+    "TestType",
+    "TestCategory",
+    "GeneratedTest",
+    "CoverageResult",
+    "MergeDecision",
+    "TestGenConfig",
 ]
