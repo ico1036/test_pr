@@ -61,7 +61,7 @@ class LoopStatus:
 def _issue_hash(issue: ValidatedIssue) -> str:
     """Generate a unique hash for an issue to detect duplicates."""
     key = f"{issue.issue.file_path}:{issue.issue.line_start}:{issue.issue.issue_type}:{issue.issue.description[:100]}"
-    return hashlib.md5(key.encode()).hexdigest()
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
 def _get_changed_files_from_diff(diff_text: str) -> Set[str]:
@@ -168,10 +168,13 @@ async def run_feedback_loop(
 
             # Filter by severity
             severity_order = ["low", "medium", "high", "critical"]
-            min_idx = severity_order.index(config.min_severity_to_fix)
+            try:
+                min_idx = severity_order.index(config.min_severity_to_fix)
+            except ValueError:
+                min_idx = 0
             potential_issues = [
                 i for i in potential_issues
-                if severity_order.index(i.severity.lower()) >= min_idx
+                if i.severity.lower() in severity_order and severity_order.index(i.severity.lower()) >= min_idx
             ]
 
             # Filter to only issues in changed files
@@ -243,14 +246,14 @@ async def run_feedback_loop(
 
             # Step 3: Fix issues
             if config.auto_fix:
-                print(f"[3/4] Auto-fixing {len(valid_issues)} issues...")
-                fixed_count, fixed_issues = await _fix_issues(valid_issues, github, attempted_issues)
+                print(f"[4/4] Auto-fixing {len(valid_issues)} issues...")
+                fixed_count, fixed_issues, fixed_files = await _fix_issues(valid_issues, github, attempted_issues)
                 status.issues_fixed = fixed_count
                 print(f"  Fixed {fixed_count}/{len(valid_issues)} issues")
 
                 if fixed_count > 0:
                     # Commit and push fixes
-                    commit_success = await _commit_and_push(config.commit_message_prefix, iteration)
+                    commit_success = await _commit_and_push(config.commit_message_prefix, iteration, fixed_files)
                     if commit_success:
                         print("  Committed and pushed fixes")
                     else:
@@ -266,8 +269,17 @@ async def run_feedback_loop(
             else:
                 # Just post comments and exit
                 print("[3/4] Posting review comments (auto-fix disabled)...")
+                posted_count = 0
+                failed_count = 0
                 for issue in valid_issues:
-                    github.post_review_comment(issue)
+                    try:
+                        github.post_review_comment(issue)
+                        posted_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        print(f"  Failed to post comment: {e}")
+                if failed_count > 0:
+                    print(f"  Posted {posted_count}/{len(valid_issues)} comments ({failed_count} failed)")
                 status.result = LoopResult.UNFIXABLE
                 statuses.append(status)
                 break
@@ -304,14 +316,15 @@ async def _fix_issues(
     issues: List[ValidatedIssue],
     github: GitHubTool,
     attempted_issues: Set[str],
-) -> Tuple[int, List[str]]:
+) -> Tuple[int, List[str], List[str]]:
     """Fix issues using Claude Agent.
 
     Returns:
-        Tuple of (fixed_count, list of fixed issue hashes)
+        Tuple of (fixed_count, list of fixed issue hashes, list of fixed file paths)
     """
     fixed_count = 0
     fixed_hashes = []
+    fixed_files = []
 
     for issue in issues:
         issue_id = _issue_hash(issue)
@@ -322,10 +335,11 @@ async def _fix_issues(
             if success:
                 fixed_count += 1
                 fixed_hashes.append(issue_id)
+                fixed_files.append(issue.issue.file_path)
         except Exception as e:
             print(f"    Failed to fix {issue.issue.file_path}: {e}")
 
-    return fixed_count, fixed_hashes
+    return fixed_count, fixed_hashes, fixed_files
 
 
 async def _fix_single_issue(issue: ValidatedIssue) -> bool:
@@ -392,7 +406,7 @@ IMPORTANT:
         return False
 
 
-async def _commit_and_push(prefix: str, iteration: int) -> bool:
+async def _commit_and_push(prefix: str, iteration: int, files: List[str]) -> bool:
     """Commit and push fixes.
 
     Returns True if changes were committed and pushed, False if no changes.
@@ -410,9 +424,9 @@ async def _commit_and_push(prefix: str, iteration: int) -> bool:
             print("    No changes to commit")
             return False
 
-        # Stage all changes
+        # Stage only the specific files that were modified
         add_proc = await asyncio.create_subprocess_exec(
-            "git", "add", "-A",
+            "git", "add", "--", *files,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -457,7 +471,11 @@ async def _commit_and_push(prefix: str, iteration: int) -> bool:
 async def _merge_pr(github: GitHubTool) -> bool:
     """Merge the PR."""
     try:
-        github.pr.merge(merge_method="squash")
+        if not hasattr(github, 'pr') or github.pr is None:
+            print("  Merge failed: PR not initialized")
+            return False
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: github.pr.merge(merge_method="squash"))
         print("  PR merged successfully!")
         return True
     except Exception as e:
