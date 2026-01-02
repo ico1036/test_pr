@@ -371,6 +371,54 @@ def cmd_testgen(args):
         sys.exit(1)
 
 
+def cmd_autofix(args):
+    """Handle 'autofix' subcommand - THE CORE LOOP."""
+    import logging
+    import os
+    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
+    logger = get_logger()
+
+    from .pipeline import run_feedback_loop, LoopConfig, LoopResult
+
+    config = LoopConfig(
+        max_iterations=args.max_iterations,
+        auto_fix=True,
+        auto_merge=not args.no_auto_merge,
+        min_severity_to_fix=args.min_severity,
+    )
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        logger.error("GITHUB_TOKEN environment variable required")
+        sys.exit(1)
+
+    try:
+        result, statuses = asyncio.run(run_feedback_loop(
+            repo=args.repo,
+            pr_number=args.pr_number,
+            config=config,
+            github_token=token,
+        ))
+
+        # Print summary
+        print("\n=== FEEDBACK LOOP SUMMARY ===")
+        print(f"Result: {result.value}")
+        print(f"Iterations: {len(statuses)}")
+        for s in statuses:
+            print(f"  [{s.iteration}] Found: {s.issues_found}, Fixed: {s.issues_fixed}")
+
+        if result == LoopResult.MERGED:
+            print("\nPR successfully merged!")
+            sys.exit(0)
+        else:
+            print(f"\nLoop ended: {result.value}")
+            sys.exit(1)
+
+    except Exception as e:
+        logger.exception(f"Autofix failed: {e}")
+        sys.exit(1)
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -544,6 +592,47 @@ def main():
         help="Enable debug logging"
     )
 
+    # autofix command - THE CORE LOOP
+    autofix_parser = subparsers.add_parser(
+        "autofix",
+        help="Review → Auto-fix → Re-review → Merge (THE CORE LOOP)"
+    )
+    autofix_parser.add_argument(
+        "--repo",
+        type=str,
+        required=True,
+        help="Repository in format owner/repo"
+    )
+    autofix_parser.add_argument(
+        "--pr-number",
+        type=int,
+        required=True,
+        help="Pull request number"
+    )
+    autofix_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=5,
+        help="Maximum fix iterations (default: 5)"
+    )
+    autofix_parser.add_argument(
+        "--no-auto-merge",
+        action="store_true",
+        help="Don't auto-merge when clean"
+    )
+    autofix_parser.add_argument(
+        "--min-severity",
+        type=str,
+        default="medium",
+        choices=["low", "medium", "high", "critical"],
+        help="Minimum severity to fix (default: medium)"
+    )
+    autofix_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
     args = parser.parse_args()
 
     # Route to subcommand
@@ -555,6 +644,8 @@ def main():
         cmd_orchestrate(args)
     elif args.command == "testgen":
         cmd_testgen(args)
+    elif args.command == "autofix":
+        cmd_autofix(args)
     else:
         # No subcommand - show help
         parser.print_help()
