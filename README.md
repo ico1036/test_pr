@@ -16,15 +16,7 @@ Claude Agent SDK 기반 PR 자동 리뷰 & 수정 & 머지 에이전트.
 claude auth login
 ```
 
-### 2. 저장소에 워크플로우 추가
-
-**방법 A: 저장소 클론**
-```bash
-git clone https://github.com/ico1036/test_pr.git
-cp test_pr/.github/workflows/pr-review.yml your-repo/.github/workflows/
-```
-
-**방법 B: 워크플로우 직접 생성**
+### 2. 워크플로우 추가
 
 `.github/workflows/pr-review.yml` 파일 생성:
 
@@ -41,17 +33,13 @@ permissions:
 
 jobs:
   review:
-    name: AI Code Review
     runs-on: self-hosted
-
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v4
-        with:
-          version: "latest"
 
       - run: uv python install 3.11
 
@@ -59,13 +47,11 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install review-agent
-        run: |
+      - run: |
           git clone https://github.com/ico1036/test_pr.git /tmp/review-agent
           cd /tmp/review-agent && uv sync
 
-      - name: Run AI Autofix
-        env:
+      - env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd /tmp/review-agent
@@ -86,14 +72,8 @@ PR 생성 시 자동으로:
 ## How It Works
 
 ```
-PR Created → Stage 1 (이슈 발굴) → Stage 2 (검증) → Auto Fix → Auto Merge
+PR Created → Issue 발굴 → Issue 검증 → Auto Fix → Auto Merge
 ```
-
-| Result | Description |
-|--------|-------------|
-| `MERGED` | 자동 머지 완료 |
-| `READY_TO_MERGE` | 이슈 없음 (auto_merge=False 시) |
-| `UNFIXABLE` | 수정 불가 이슈 존재 |
 
 ---
 
@@ -101,10 +81,3 @@ PR Created → Stage 1 (이슈 발굴) → Stage 2 (검증) → Auto Fix → Aut
 
 - Self-hosted GitHub Actions Runner
 - Claude Code Max 구독 (`claude auth login`)
-- GitHub Token (자동 제공됨)
-
----
-
-## License
-
-MIT
