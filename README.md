@@ -11,8 +11,13 @@ Claude Agent SDK 기반 PR 자동 리뷰 & 수정 & 머지 에이전트.
 ### 1. Self-hosted Runner 설정
 
 ```bash
-# GitHub 웹 → Settings → Actions → Runners → "New self-hosted runner"
-# 안내에 따라 설치 후 Claude Code 인증:
+# 1) GitHub 웹 → Settings → Actions → Runners → "New self-hosted runner"
+#    https://docs.github.com/en/actions/hosting-your-own-runners
+
+# 2) Claude Code 설치 (Max 구독 필요)
+npm install -g @anthropic-ai/claude-code
+
+# 3) 인증
 claude auth login
 ```
 
