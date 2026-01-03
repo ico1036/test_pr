@@ -120,24 +120,23 @@ Claude Code Max 구독 + Claude Agent SDK를 활용한 2-Stage PR Review Agent �
 
 ```
 review_agent/
-├── main.py                 # Entry point
+├── main.py                 # Entry point + CLI
 ├── config.py               # Configuration
 ├── pipeline/
-│   ├── __init__.py
 │   ├── stage1_identify.py  # Issue identification
-│   └── stage2_validate.py  # Issue validation
+│   ├── stage2_validate.py  # Issue validation
+│   ├── stage3_test_gen.py  # Test generation
+│   ├── stage4_coverage.py  # Coverage gate
+│   └── feedback_loop.py    # Autofix loop
+├── orchestrator/           # Multi-PR management
 ├── tools/
-│   ├── __init__.py
 │   ├── storage_tool.py     # Structured output collection
 │   ├── github_tool.py      # GitHub API wrapper
 │   └── diff_parser.py      # Git diff parsing
 ├── models/
-│   ├── __init__.py
 │   ├── issue.py            # Issue data model
 │   └── review.py           # Review comment model
 └── utils/
-    ├── __init__.py
-    └── logging.py
 ```
 
 ### 3.2 Data Models
@@ -303,176 +302,19 @@ jobs:
 
 ---
 
-## 5. Implementation Details
+## 5. CLI Usage
 
-### 5.1 Main Entry Point
+실제 사용법은 README.md 참조. 주요 명령어:
 
-```python
-# main.py
-import argparse
-from claude_agent_sdk import Agent
-from pipeline.stage1_identify import identify_issues
-from pipeline.stage2_validate import validate_issues
-from tools.github_tool import GitHubTool
-from tools.diff_parser import parse_pr_diff
+```bash
+# PR 리뷰
+review-agent review --repo owner/repo --pr-number 123
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--pr-number', type=int, required=True)
-    parser.add_argument('--repo', type=str, required=True)
-    args = parser.parse_args()
+# 자동 수정 + 머지
+review-agent autofix --repo owner/repo --pr-number 123
 
-    # Initialize
-    github = GitHubTool(args.repo, args.pr_number)
-
-    # Get PR diff
-    hunks = parse_pr_diff(github.get_diff())
-
-    # Stage 1: Identify potential issues
-    potential_issues = identify_issues(hunks)
-    print(f"Stage 1: Found {len(potential_issues)} potential issues")
-
-    # Stage 2: Validate issues
-    validated_issues = validate_issues(potential_issues)
-    valid_count = sum(1 for i in validated_issues if i.is_valid)
-    print(f"Stage 2: {valid_count} valid issues (filtered {len(potential_issues) - valid_count} false positives)")
-
-    # Post reviews
-    for issue in validated_issues:
-        if issue.is_valid and issue.confidence >= 0.7:
-            github.post_review_comment(issue)
-
-    print("Review completed!")
-
-if __name__ == "__main__":
-    main()
-```
-
-### 5.2 Stage 1: Issue Identification
-
-```python
-# pipeline/stage1_identify.py
-from typing import List
-from claude_agent_sdk import Agent
-from tools.storage_tool import StorageTool
-from models.issue import PotentialIssue
-
-STAGE1_PROMPT = """
-You are a code reviewer. Analyze the following code changes (hunks) and identify ALL potential issues.
-
-Be aggressive in finding issues - it's okay to have false positives at this stage.
-They will be filtered in the next stage.
-
-Categories to look for:
-- Bugs and logic errors
-- Security vulnerabilities (XSS, injection, etc.)
-- Performance issues
-- Type errors
-- Unused code
-- Best practice violations
-
-For each issue found, call the `store_issue` tool with:
-- file_path: path to the file
-- line_start/line_end: line numbers
-- issue_type: one of [bug, security, performance, logic_error, type_error, unused_code, best_practice]
-- severity: one of [critical, high, medium, low]
-- description: clear explanation of the issue
-- code_snippet: the problematic code
-
-Hunks to analyze:
-{hunks}
-"""
-
-def identify_issues(hunks: List[dict]) -> List[PotentialIssue]:
-    storage = StorageTool[PotentialIssue]()
-
-    agent = Agent(
-        model="claude-sonnet-4-5",
-        tools=[
-            {
-                "name": "store_issue",
-                "description": "Store a potential issue found in the code",
-                "handler": storage.store,
-                "schema": PotentialIssue.__annotations__
-            }
-        ],
-        mcp_servers=["sequential-thinking"]  # 복잡한 추론 활용
-    )
-
-    agent.run(STAGE1_PROMPT.format(hunks=format_hunks(hunks)))
-
-    return storage.values
-```
-
-### 5.3 Stage 2: Issue Validation
-
-```python
-# pipeline/stage2_validate.py
-from typing import List
-from claude_agent_sdk import Agent
-from tools.storage_tool import StorageTool
-from models.issue import PotentialIssue, ValidatedIssue
-
-STAGE2_PROMPT = """
-You are validating a potential code issue. Your job is to determine if this is a REAL issue or a FALSE POSITIVE.
-
-Use the available tools to gather evidence:
-1. Use `serena` to search the codebase for related code, usage patterns, and context
-2. Use `context7` to look up library documentation if the issue involves external libraries
-
-Potential Issue:
-- File: {file_path}
-- Lines: {line_start}-{line_end}
-- Type: {issue_type}
-- Description: {description}
-- Code: {code_snippet}
-
-After investigation, call `store_verdict` with:
-- is_valid: true if this is a real issue, false if it's a false positive
-- evidence: list of findings from codebase search
-- library_reference: relevant documentation (if any)
-- mitigation: how to fix (if valid)
-- confidence: 0.0-1.0
-"""
-
-def validate_issues(potential_issues: List[PotentialIssue]) -> List[ValidatedIssue]:
-    validated = []
-
-    for issue in potential_issues:
-        storage = StorageTool[ValidatedIssue]()
-
-        agent = Agent(
-            model="claude-sonnet-4-5",
-            tools=[
-                {
-                    "name": "store_verdict",
-                    "description": "Store the validation verdict",
-                    "handler": lambda v: storage.store(ValidatedIssue(issue=issue, **v)),
-                    "schema": {
-                        "is_valid": bool,
-                        "evidence": List[str],
-                        "library_reference": str,
-                        "mitigation": str,
-                        "confidence": float
-                    }
-                }
-            ],
-            mcp_servers=["serena", "context7"]  # 검색 도구 활용
-        )
-
-        agent.run(STAGE2_PROMPT.format(
-            file_path=issue.file_path,
-            line_start=issue.line_start,
-            line_end=issue.line_end,
-            issue_type=issue.issue_type.value,
-            description=issue.description,
-            code_snippet=issue.code_snippet
-        ))
-
-        if storage.values:
-            validated.append(storage.values[0])
-
-    return validated
+# 다중 PR 관리
+review-agent orchestrate --repo owner/repo
 ```
 
 ---
@@ -620,75 +462,7 @@ pytest-cov>=4.1.0
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 11.2 Orchestrator Data Model
-
-```python
-# models/orchestrator.py
-from dataclasses import dataclass
-from enum import Enum
-from typing import List, Dict
-
-class PRStatus(Enum):
-    PENDING = "pending"
-    REVIEWING = "reviewing"
-    APPROVED = "approved"
-    MERGED = "merged"
-    FAILED = "failed"
-    CONFLICT = "conflict"
-
-@dataclass
-class PRNode:
-    pr_number: int
-    branch: str
-    base: str                    # target branch
-    status: PRStatus
-    depends_on: List[int]        # 의존하는 PR 번호들
-    conflicts_with: List[int]    # 충돌 가능성 있는 PR
-    changed_files: List[str]     # 변경된 파일 목록
-
-class PROrchestrator:
-    def __init__(self):
-        self.queue: Dict[int, PRNode] = {}
-
-    def analyze_dependencies(self) -> List[List[int]]:
-        """토폴로지 정렬로 병렬 실행 가능한 그룹 반환"""
-        ...
-
-    def predict_conflicts(self, pr_a: int, pr_b: int) -> bool:
-        """두 PR의 변경 파일이 겹치는지 확인"""
-        files_a = set(self.queue[pr_a].changed_files)
-        files_b = set(self.queue[pr_b].changed_files)
-        return bool(files_a & files_b)
-
-    def get_merge_order(self) -> List[int]:
-        """의존성과 충돌을 고려한 최적 merge 순서"""
-        ...
-```
-
-### 11.3 Merge Executor
-
-```python
-# pipeline/merge_executor.py
-class MergeExecutor:
-    async def execute_merge_plan(self, pr_order: List[int]):
-        for pr_number in pr_order:
-            # 1. 최신 base와 충돌 체크
-            if await self.has_conflicts(pr_number):
-                success = await self.attempt_auto_rebase(pr_number)
-                if not success:
-                    await self.notify_conflict(pr_number)
-                    continue
-
-            # 2. CI 통과 확인
-            if not await self.ci_passed(pr_number):
-                await self.notify_ci_failure(pr_number)
-                continue
-
-            # 3. Merge 실행
-            await self.github.merge_pr(pr_number, method="squash")
-```
-
-### 11.4 확장 시 기존 코드 수정량
+### 11.2 확장 시 기존 코드 수정량
 
 | 컴포넌트 | 수정 필요 | 설명 |
 |----------|-----------|------|
@@ -799,191 +573,7 @@ Why "Merge 직전" timing:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 12.2 Test Generation Data Models
-
-```python
-# models/test.py
-from dataclasses import dataclass
-from typing import List, Optional
-
-@dataclass
-class GeneratedTest:
-    file_path: str               # tests/test_new_feature.py
-    content: str                 # 테스트 코드
-    covers_functions: List[str]  # 커버하는 함수들
-    covers_issues: List[int]     # 커버하는 이슈 번호
-    test_type: str               # unit, integration, e2e
-
-@dataclass
-class CoverageResult:
-    total_coverage: float        # 전체 커버리지 %
-    new_code_coverage: float     # 새 코드만 커버리지 %
-    uncovered_lines: List[str]   # 커버 안 된 라인들
-    tests_passed: int
-    tests_failed: int
-    test_duration_seconds: float
-
-@dataclass
-class MergeDecision:
-    approved: bool
-    reason: str
-    coverage: CoverageResult
-    conditions_met: dict         # 각 조건 통과 여부
-    generated_tests_count: int
-```
-
-### 12.3 Merge Rules Configuration
-
-```python
-# config.py
-from dataclasses import dataclass
-
-@dataclass
-class MergeRules:
-    # 커버리지 기준
-    min_total_coverage: float = 80.0       # 전체 80% 이상
-    min_new_code_coverage: float = 90.0    # 새 코드 90% 이상
-
-    # 테스트 기준
-    all_tests_must_pass: bool = True
-    min_tests_per_function: int = 2
-    require_edge_case_tests: bool = True
-
-    # 이슈 기준
-    allow_low_severity_issues: bool = True
-    block_on_critical: bool = True
-    block_on_high: bool = True
-    max_medium_issues: int = 3
-
-    # 자동화 수준
-    auto_merge_on_pass: bool = False       # True면 조건 충족시 자동 Merge
-    auto_commit_tests: bool = True         # 생성된 테스트를 PR에 커밋
-    auto_fix_simple_issues: bool = False   # 간단한 이슈 자동 수정
-```
-
-### 12.4 Stage 3: Test Generation Implementation
-
-```python
-# pipeline/stage3_test_gen.py
-
-TEST_GEN_PROMPT = """
-You are a TDD expert. Generate comprehensive test cases for the code changes.
-
-## Rules
-1. 각 변경된 함수/메서드마다:
-   - Happy path 테스트 (정상 동작)
-   - Edge case 테스트 (경계값, null, empty)
-   - Error case 테스트 (예외 처리)
-
-2. 기존 테스트 스타일 따르기:
-   - serena로 기존 테스트 파일 검색
-   - 동일한 패턴, 네이밍, 구조 사용
-
-3. 발견된 이슈에 대한 회귀 테스트:
-   - 각 validated issue에 대해 테스트 추가
-   - "이 테스트가 통과하면 이슈가 해결된 것"
-
-## PR Changes
-{pr_diff}
-
-## Validated Issues
-{validated_issues}
-
-## Instructions
-1. serena로 기존 테스트 패턴 검색
-2. context7로 테스트 프레임워크 문서 참조
-3. store_test 도구로 각 테스트 파일 저장
-"""
-
-async def generate_tests(
-    pr_diff: str,
-    validated_issues: List[ValidatedIssue]
-) -> List[GeneratedTest]:
-    storage = StorageTool[GeneratedTest]()
-
-    agent = Agent(
-        model="claude-sonnet-4-5",
-        tools=[
-            {
-                "name": "store_test",
-                "description": "Store a generated test file",
-                "handler": storage.store,
-                "schema": GeneratedTest.__annotations__
-            }
-        ],
-        mcp_servers=["serena", "context7"]
-    )
-
-    agent.run(TEST_GEN_PROMPT.format(
-        pr_diff=pr_diff,
-        validated_issues=format_issues(validated_issues)
-    ))
-
-    return storage.values
-```
-
-### 12.5 Stage 4: Coverage Gate Implementation
-
-```python
-# pipeline/stage4_coverage.py
-
-class CoverageGate:
-    def __init__(self, rules: MergeRules):
-        self.rules = rules
-
-    async def execute(
-        self,
-        generated_tests: List[GeneratedTest],
-        validated_issues: List[ValidatedIssue]
-    ) -> MergeDecision:
-
-        # 1. 생성된 테스트 파일 작성
-        for test in generated_tests:
-            await self.write_test_file(test)
-
-        # 2. 테스트 실행 + 커버리지 측정
-        coverage = await self.run_tests_with_coverage()
-
-        # 3. 룰 기반 Merge 결정
-        conditions = self.check_conditions(coverage, validated_issues)
-
-        approved = all(conditions.values())
-
-        return MergeDecision(
-            approved=approved,
-            reason=self.generate_reason(conditions),
-            coverage=coverage,
-            conditions_met=conditions,
-            generated_tests_count=len(generated_tests)
-        )
-
-    def check_conditions(
-        self,
-        coverage: CoverageResult,
-        issues: List[ValidatedIssue]
-    ) -> dict:
-        return {
-            "all_tests_pass": coverage.tests_failed == 0,
-            "min_coverage_met": coverage.new_code_coverage >= self.rules.min_new_code_coverage,
-            "no_critical_issues": not any(
-                i.is_valid and i.issue.severity.value == "critical"
-                for i in issues
-            ),
-            "no_high_issues": not any(
-                i.is_valid and i.issue.severity.value == "high"
-                for i in issues
-            ) if self.rules.block_on_high else True,
-        }
-
-    async def run_tests_with_coverage(self) -> CoverageResult:
-        # Python 프로젝트
-        result = await bash.run(
-            "pytest --cov=src --cov-report=json --cov-report=term tests/"
-        )
-        return self.parse_pytest_coverage(result)
-```
-
-### 12.6 Complete Flow Example
+### 12.2 Complete Flow Example
 
 ```
 PR #123 Created (feature/user-auth)
@@ -1030,7 +620,7 @@ PR #123 Created (feature/user-auth)
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 12.7 Phase 3 확장 시 기존 코드 수정량
+### 12.3 Phase 3 확장 시 기존 코드 수정량
 
 | 컴포넌트 | 수정 필요 | 설명 |
 |----------|-----------|------|
