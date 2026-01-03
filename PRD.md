@@ -535,10 +535,11 @@ import DOMPurify from 'dompurify';
 - 복잡한 비즈니스 로직 이해 한계
 
 ### 8.2 Future Enhancements
-- [ ] 학습 기반 오탐 감소 (피드백 루프)
+- [x] ~~학습 기반 오탐 감소 (피드백 루프)~~ → Phase 3.5에서 구현
 - [ ] 리뷰어별 스타일 학습
 - [ ] 멀티 리포지토리 지원
 - [ ] Slack/Discord 알림 연동
+- [ ] pip 패키지 배포 (PyPI)
 
 ---
 
@@ -1077,11 +1078,169 @@ PR #123 Created (feature/user-auth)
 │  - 회귀 테스트 자동 생성 (validated issues 기반)                         │
 │  - CLI: testgen --repo owner/repo --pr-number 1 --dry-run                │
 │                                                                          │
-│  Phase 4: Advanced (Future)                                              │
+│  Phase 3.5: Feedback Loop ✅ COMPLETE                                    │
+│  ─────────────────────────────────────                                   │
+│  - Review → Fix → Re-review → Merge 자동화                               │
+│  - 이슈 자동 수정 (Claude Agent SDK)                                     │
+│  - 중복 이슈 감지 (SHA256 해시)                                          │
+│  - 파일 변경 검증 (before/after diff)                                    │
+│  - Git commit/push 자동화                                                │
+│  - 통합 테스트 (SQL injection, Command injection 등)                     │
+│  - CLI: autofix --repo owner/repo --pr-number 1                          │
+│                                                                          │
+│  Phase 4: Distribution (Next)                                            │
+│  ────────────────────────────                                            │
+│  - pip 패키지 배포 (PyPI)                                                │
+│  - GitHub Action 템플릿                                                  │
+│  - 설치 스크립트 (install.sh)                                            │
+│                                                                          │
+│  Phase 5: Advanced (Future)                                              │
 │  ─────────────────────────                                               │
 │  - Conflict 자동 해결 Agent                                              │
 │  - 피드백 기반 학습                                                      │
 │  - 멀티 리포지토리                                                       │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 14. Extension: Feedback Loop (Phase 3.5) ✅ COMPLETE
+
+> PR 리뷰만 하는 것이 아니라, 발견된 이슈를 자동으로 수정하고 다시 리뷰하여 머지까지 완료.
+
+### 14.1 Feedback Loop Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Feedback Loop: Review → Fix → Merge                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   PR Created                                                             │
+│       │                                                                  │
+│       ▼                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ ITERATION 1                                                      │   │
+│   │                                                                  │   │
+│   │   [1] Stage 1: Identify Issues                                   │   │
+│   │       │                                                          │   │
+│   │       ▼                                                          │   │
+│   │   [2] Stage 2: Validate Issues                                   │   │
+│   │       │                                                          │   │
+│   │       ▼                                                          │   │
+│   │   [3] Fix Issues (Claude Agent + Edit Tool)                      │   │
+│   │       │                                                          │   │
+│   │       ▼                                                          │   │
+│   │   [4] Git Commit & Push                                          │   │
+│   │       │                                                          │   │
+│   └───────┼──────────────────────────────────────────────────────────┘   │
+│           │                                                              │
+│           ▼                                                              │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ ITERATION 2 (Re-review)                                          │   │
+│   │                                                                  │   │
+│   │   Issues Found?                                                  │   │
+│   │       │                                                          │   │
+│   │   ┌───┴───┐                                                      │   │
+│   │   ▼       ▼                                                      │   │
+│   │  Yes     No ──▶ READY_TO_MERGE ──▶ Auto Merge                   │   │
+│   │   │                                                              │   │
+│   │   ▼                                                              │   │
+│   │  Continue Loop...                                                │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+│   Exit Conditions:                                                       │
+│   - MERGED: PR successfully merged                                       │
+│   - READY_TO_MERGE: Clean (auto_merge=False)                            │
+│   - UNFIXABLE: Issues couldn't be fixed                                  │
+│   - MAX_ITERATIONS: Hit iteration limit                                  │
+│   - TEST_FAILED: Tests failed after fix                                  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 14.2 Data Models
+
+```python
+class LoopResult(Enum):
+    MERGED = "merged"
+    READY_TO_MERGE = "ready_to_merge"
+    MAX_ITERATIONS = "max_iterations"
+    UNFIXABLE = "unfixable"
+    TEST_FAILED = "test_failed"
+    ERROR = "error"
+
+@dataclass
+class LoopConfig:
+    max_iterations: int = 5
+    auto_fix: bool = True
+    auto_merge: bool = True
+    min_severity_to_fix: str = "medium"
+    run_tests: bool = False
+    test_command: str = "pytest"
+```
+
+### 14.3 CLI Usage
+
+```bash
+# Basic usage
+python -m review_agent.main autofix \
+  --repo owner/repo \
+  --pr-number 123
+
+# With options
+python -m review_agent.main autofix \
+  --repo owner/repo \
+  --pr-number 123 \
+  --max-iterations 3 \
+  --run-tests \
+  --no-auto-merge
+```
+
+### 14.4 Key Features
+
+| Feature | Description |
+|---------|-------------|
+| Issue Deduplication | SHA256 hash로 중복 이슈 감지 |
+| File Change Verification | 수정 전/후 파일 비교 |
+| PR Diff Targeting | PR 변경 파일만 분석 |
+| Test Verification | 수정 후 테스트 실행 |
+| Auto Merge | 조건 충족시 자동 머지 |
+
+---
+
+## 15. Distribution Plan (Phase 4)
+
+### 15.1 pip Package
+
+```bash
+pip install review-agent
+review-agent autofix --repo owner/repo --pr-number 123
+```
+
+### 15.2 GitHub Action Template
+
+```yaml
+name: AI Autofix
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+jobs:
+  autofix:
+    runs-on: self-hosted
+    if: |
+      github.event_name == 'pull_request' ||
+      contains(github.event.comment.body, '/autofix')
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          pip install review-agent
+          review-agent autofix \
+            --repo ${{ github.repository }} \
+            --pr-number ${{ github.event.pull_request.number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
