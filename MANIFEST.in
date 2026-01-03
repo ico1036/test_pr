@@ -1,0 +1,7 @@
+include README.md
+include PRD.md
+include LICENSE
+recursive-include review_agent *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .git*
