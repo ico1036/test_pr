@@ -5,7 +5,7 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -42,7 +42,7 @@ jobs:
         run: |
           npm install -g @modelcontextprotocol/server-sequential-thinking
 
-      - name: Run AI PR Review
+      - name: Run AI Autofix
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -50,7 +50,7 @@ jobs:
           # For API key authentication (alternative to self-hosted):
           # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          uv run review-agent review \
+          uv run review-agent autofix \
             --repo "$GITHUB_REPOSITORY" \
             --pr-number "$PR_NUMBER"
 
