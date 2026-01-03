@@ -18,7 +18,7 @@ from typing import List
 
 from .config import ReviewConfig
 from .models import ValidatedIssue
-from .pipeline import identify_issues, validate_issues
+from .pipeline import identify_issues, validate_issues, run_feedback_loop, LoopConfig, LoopResult
 from .tools import GitHubTool, parse_pr_diff, format_hunks
 from .utils import setup_logging, get_logger
 
@@ -281,6 +281,77 @@ def cmd_orchestrate(args):
         sys.exit(1)
 
 
+def cmd_autofix(args):
+    """Handle 'autofix' subcommand - THE CORE FEEDBACK LOOP."""
+    import logging
+    import os
+    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
+    logger = get_logger()
+
+    if not args.repo:
+        logger.error("Repository required. Use --repo")
+        sys.exit(1)
+    if not args.pr_number:
+        logger.error("PR number required. Use --pr-number")
+        sys.exit(1)
+
+    # Get GitHub token
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        logger.error("GITHUB_TOKEN environment variable required")
+        sys.exit(1)
+
+    # Build config
+    config = LoopConfig(
+        max_iterations=args.max_iterations,
+        auto_fix=True,
+        auto_merge=not args.no_auto_merge,
+        min_severity_to_fix=args.min_severity,
+        run_tests=args.run_tests,
+        test_command=args.test_command,
+        require_tests_pass=args.require_tests,
+        working_dir=os.getcwd(),
+    )
+
+    logger.info(f"Starting feedback loop for {args.repo} PR #{args.pr_number}")
+    logger.info(f"Config: max_iterations={config.max_iterations}, auto_merge={config.auto_merge}, run_tests={config.run_tests}")
+
+    try:
+        result, statuses = asyncio.run(run_feedback_loop(
+            repo=args.repo,
+            pr_number=args.pr_number,
+            config=config,
+            github_token=github_token,
+        ))
+
+        # Print summary
+        print("\n=== FEEDBACK LOOP SUMMARY ===")
+        print(f"Result: {result.value}")
+        print(f"Iterations: {len(statuses)}")
+        for s in statuses:
+            print(f"  [{s.iteration}] Found: {s.issues_found}, Fixed: {s.issues_fixed}, Skipped: {s.issues_skipped}")
+
+        if result == LoopResult.MERGED:
+            print("\nPR successfully merged!")
+            sys.exit(0)
+        elif result == LoopResult.READY_TO_MERGE:
+            print("\nPR is ready to merge (auto-merge disabled)")
+            sys.exit(0)
+        elif result == LoopResult.UNFIXABLE:
+            print("\nSome issues could not be fixed")
+            sys.exit(1)
+        elif result == LoopResult.TEST_FAILED:
+            print("\nTests failed after fixes")
+            sys.exit(1)
+        else:
+            print(f"\nLoop ended: {result.value}")
+            sys.exit(1)
+
+    except Exception as e:
+        logger.exception(f"Feedback loop failed: {e}")
+        sys.exit(1)
+
+
 def cmd_testgen(args):
     """Handle 'testgen' subcommand (Phase 3)."""
     import logging
@@ -494,6 +565,63 @@ def main():
         help="Enable debug logging"
     )
 
+    # autofix command - THE CORE
+    autofix_parser = subparsers.add_parser(
+        "autofix",
+        help="Review → Fix → Re-review → Merge (THE CORE)"
+    )
+    autofix_parser.add_argument(
+        "--repo",
+        type=str,
+        required=True,
+        help="Repository in format owner/repo"
+    )
+    autofix_parser.add_argument(
+        "--pr-number",
+        type=int,
+        required=True,
+        help="Pull request number"
+    )
+    autofix_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=5,
+        help="Maximum fix iterations (default: 5)"
+    )
+    autofix_parser.add_argument(
+        "--min-severity",
+        type=str,
+        default="medium",
+        choices=["low", "medium", "high", "critical"],
+        help="Minimum severity to fix (default: medium)"
+    )
+    autofix_parser.add_argument(
+        "--no-auto-merge",
+        action="store_true",
+        help="Don't auto-merge when PR is clean"
+    )
+    autofix_parser.add_argument(
+        "--run-tests",
+        action="store_true",
+        help="Run tests after each fix iteration"
+    )
+    autofix_parser.add_argument(
+        "--test-command",
+        type=str,
+        default="pytest",
+        help="Command to run tests (default: pytest)"
+    )
+    autofix_parser.add_argument(
+        "--require-tests",
+        action="store_true",
+        help="Require tests to pass before merge"
+    )
+    autofix_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
     # testgen command (Phase 3)
     testgen_parser = subparsers.add_parser(
         "testgen",
@@ -555,6 +683,8 @@ def main():
         cmd_orchestrate(args)
     elif args.command == "testgen":
         cmd_testgen(args)
+    elif args.command == "autofix":
+        cmd_autofix(args)
     else:
         # No subcommand - show help
         parser.print_help()
